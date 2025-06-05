@@ -1,0 +1,240 @@
+#include <freertos/FreeRTOS.h>
+
+#include <ESP32DMASPISlave.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <Wire.h>
+#include <BME280I2C.h>
+#include <driver/i2s.h>
+
+ESP32DMASPI::Slave slave;
+#define LED_PIN  13
+#define BLE_DEVICE_NAME     "HAHA-NO-ECHO"
+#define SERVICE_UUID        "3f9b3b8e-0c3d-4a72-85a6-b267e9b3b52e"
+#define CHARACTERISTIC_UUID "c67427d5-e705-4b37-8e58-68384ae1eacf"
+
+#define C_WIRE_SDA 21     // I2C
+#define C_WIRE_SCL 22     // I2C
+
+#define C_CMD_TEMP    ("Temp")
+
+BME280I2C bme;
+
+BLEServer *gpBLEServer = NULL;
+BLECharacteristic *gpCharacteristic = NULL;
+bool gbBLEReady = false;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
+
+// bme result
+float gfTemp = 0.0f;
+float gfHum  = 0.0f;
+float gfPres = 0.0f;
+
+byte gbRXData[ 128 ];
+byte gbTXData[ 128 ];
+bool bleOn = false;
+bool ledSW = false;
+int gbRXDataPos = 0;
+
+static const uint32_t BUFFER_SIZE = 8192;
+uint8_t* spi_slave_tx_buf;
+uint8_t* spi_slave_rx_buf;
+
+void setup() {
+  // put your setup code here, to run once:
+  Serial.begin( 115200 );
+  memset( gbRXData, 0x00, sizeof( gbRXData ) );
+  memset( gbTXData, 0x00, sizeof( gbTXData ) );
+  // check file system exists
+  pinMode(LED_PIN, OUTPUT);
+  Wire.begin( C_WIRE_SDA, C_WIRE_SCL );
+
+  xTaskCreatePinnedToCore( Task_Bluetooth,   /* タスクの入口となる関数名 */
+                           "TASK1", /* タスクの名称 */
+                           4096,   /* スタックサイズ */
+                           NULL,    /* パラメータのポインタ */
+                           1,       /* プライオリティ */
+                           NULL,    /* ハンドル構造体のポインタ */
+                           0 );     /* 割り当てるコア (0/1) */
+
+  xTaskCreatePinnedToCore( Task_Bme,   
+                           "TASK3", 
+                           2048,   
+                           NULL,    
+                           1,       
+                           NULL,    
+                           0 );     
+  
+}
+//---------------------------------------------------------
+// Callbacks
+//---------------------------------------------------------
+class MyServerCallbacks: public BLEServerCallbacks {
+  void onConnect(BLEServer *pServer) {
+    deviceConnected = true;
+  };
+  void onDisconnect(BLEServer *pServer) {
+    deviceConnected = false;
+  }
+};
+
+class MyCharacteristicCallbacks: public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCharacteristic2) {
+    String rxValue = pCharacteristic2->getValue();
+    memset( gbRXData, 0x00, sizeof( gbRXData ) );
+    if( rxValue.length() > 0 ){
+      int iOffset = gbRXDataPos;
+      for(int i=0; i<rxValue.length(); i++ ){
+        if ( byte( rxValue[ i ] ) == 0 ) continue;
+        gbRXData[ iOffset + i ] = rxValue[ i ];
+        gbRXDataPos++;
+      }
+      if ( gbRXData[ gbRXDataPos -1 ] == 0x0A ){
+        gbRXData[ gbRXDataPos -1 ] = 0x00;
+        bleOn = true;
+        gbRXDataPos = 0;
+      }
+    }
+  }
+};
+
+void loop() {
+  // put your main code here, to run repeatedly:
+  
+}
+
+void Task_Bluetooth( void *param )
+{
+  BluetoothSetup();
+  while( 1 )
+  {
+    Bluetooth_Loop();
+    vTaskDelay( 100 );
+  }
+}
+
+void BluetoothSetup()
+{
+  
+  BLEDevice::init( BLE_DEVICE_NAME );
+  // Server
+  gpBLEServer = BLEDevice::createServer();
+  gpBLEServer->setCallbacks( new MyServerCallbacks() );
+  // Service
+  BLEService *pService = gpBLEServer->createService( SERVICE_UUID );
+  // Characteristic
+  gpCharacteristic = pService->createCharacteristic(
+                                CHARACTERISTIC_UUID,
+                                BLECharacteristic::PROPERTY_READ   |
+                                BLECharacteristic::PROPERTY_WRITE  |
+                                BLECharacteristic::PROPERTY_NOTIFY |
+                                BLECharacteristic::PROPERTY_INDICATE
+  );
+  gpCharacteristic->addDescriptor( new BLE2902() );
+  gpCharacteristic->setCallbacks( new MyCharacteristicCallbacks() );
+  //
+  pService->start();
+  // Advertising
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID( SERVICE_UUID );
+  pAdvertising->setScanResponse( true );
+  pAdvertising->setMinPreferred( 0x0 );
+  pAdvertising->setMinPreferred( 0x06 );  // functions that help with iPhone connections issue
+  pAdvertising->setMinPreferred( 0x12 );
+  BLEDevice::startAdvertising();
+  
+}
+
+
+void Bluetooth_Loop()
+{
+  int iStatus;
+  
+  // disconnecting
+  if(!deviceConnected && oldDeviceConnected){
+    vTaskDelay(500); // give the bluetooth stack the chance to get things ready
+    gpBLEServer->startAdvertising();
+    oldDeviceConnected = deviceConnected;
+  }
+  // connecting
+  if(deviceConnected && !oldDeviceConnected){
+    oldDeviceConnected = deviceConnected;
+    
+  }
+
+  if ( ( deviceConnected == true ) && ( bleOn == true ) ){
+
+    if ( ledSW == true ) {
+        ledSW = false;
+        digitalWrite(LED_PIN, LOW);
+    }else{
+        ledSW = true;
+        digitalWrite(LED_PIN, HIGH);
+    }
+
+    if (memcmp(gbRXData, C_CMD_TEMP, sizeof(C_CMD_TEMP) ) == 0) {
+      memset( gbTXData, 0x00, sizeof( gbTXData ) );
+      sprintf( (char *)gbTXData, "%4.2fC %3.0f%% %7.2fhPa\r\n",
+        gfTemp, gfHum, gfPres
+      );
+    }else{
+      memset( gbTXData, 0x00, sizeof( gbTXData ) );
+      sprintf( (char *)gbTXData, "unknown command.\n"
+      );
+
+    }
+
+    gpCharacteristic->setValue( (uint8_t *)&gbTXData, strlen( (char *)&gbTXData ) );
+    gpCharacteristic->notify();
+
+    vTaskDelay( 50 );
+  }
+
+  if ( bleOn == true ) bleOn = false;
+
+}
+
+//------------------------------------------------------------------------------
+//
+//------------------------------------------------------------------------------
+void Task_Bme( void *param )
+{
+  int iMin;
+  
+  Task_Bme_Setup();
+  while ( 1 ){
+    Task_Bme_Loop();
+    iMin = 0;
+    while ( iMin < 15 ){       // 15min
+      vTaskDelay( 60000 );
+      iMin++;
+    }
+  }
+}
+
+//------------------------------------------------------------------------------
+//
+//------------------------------------------------------------------------------
+void Task_Bme_Setup()
+{
+  while ( !bme.begin() ){
+    vTaskDelay( 100 );
+  }
+}
+
+//------------------------------------------------------------------------------
+//
+//------------------------------------------------------------------------------
+void Task_Bme_Loop()
+{
+  BME280::TempUnit tempUnit(BME280::TempUnit_Celsius);
+  BME280::PresUnit presUnit(BME280::PresUnit_Pa);
+
+  bme.read( gfPres, gfTemp, gfHum, tempUnit, presUnit );
+  gfPres /= 100.0;     // Bug?
+
+}
+
